@@ -1069,7 +1069,7 @@ def run_qwen2_vl(questions: list[str], modality: str) -> ModelRequestData:
 
 # Qwen2.5-VL
 def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 
     engine_args = EngineArgs(
         model=model_name,
@@ -1081,6 +1081,7 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
             "fps": 1,
         },
         limit_mm_per_prompt={modality: 1},
+        gpu_memory_utilization=0.4,
     )
 
     if modality == "image":
@@ -1107,6 +1108,7 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
 # Qwen2.5-Omni
 def run_qwen2_5_omni(questions: list[str], modality: str):
     model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = "Qwen/Qwen2.5-Omni-3B"
 
     engine_args = EngineArgs(
         model=model_name,
@@ -1118,6 +1120,7 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
             "fps": [1],
         },
         limit_mm_per_prompt={modality: 1},
+        gpu_memory_utilization=0.4,
     )
 
     if modality == "image":
@@ -1353,7 +1356,7 @@ def parse_args():
         help='Huggingface "model_type".',
     )
     parser.add_argument(
-        "--num-prompts", type=int, default=4, help="Number of prompts to run."
+        "--num-prompts", type=int, default=1, help="Number of prompts to run."
     )
     parser.add_argument(
         "--modality",
@@ -1403,6 +1406,40 @@ def parse_args():
     return parser.parse_args()
 
 
+
+
+
+from transformers import AutoImageProcessor, Qwen2_5_VLModel, Qwen2_5OmniThinkerForConditionalGeneration
+import torch
+
+class VllmEncodeWorker:
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            self.model, trust_remote_code=True
+        )
+        # self.vision_model = LlavaForConditionalGeneration.from_pretrained(
+        #     self.model, device_map="auto", torch_dtype=torch.float16
+        # ).eval()
+        if 'VL' in self.model:
+            self.vision_model = Qwen2_5_VLModel.from_pretrained(
+                self.model, device_map="auto", torch_dtype=torch.float16,
+            ).eval()
+        else:
+            assert 'Omni' in self.model
+            self.vision_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                self.model, device_map="auto", torch_dtype=torch.float16,
+            ).eval()
+
+    def generate(self, image):
+        image_embeds = self.image_processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            pixel_values = image_embeds["pixel_values"].type(self.vision_model.visual.dtype).to(self.vision_model.device)
+            image_grid_thw = image_embeds["image_grid_thw"]
+            embeddings = self.vision_model.visual(pixel_values, grid_thw=image_grid_thw)
+            return embeddings, image_grid_thw
+
 def main(args):
     model = args.model_type
     if model not in model_example_map:
@@ -1411,9 +1448,27 @@ def main(args):
     modality = args.modality
     mm_input = get_multi_modal_input(args)
     data = mm_input["data"]
+
+    if 'vl' in model:
+        worker = VllmEncodeWorker("Qwen/Qwen2.5-VL-7B-Instruct")
+    else:
+        worker = VllmEncodeWorker("Qwen/Qwen2.5-Omni-3B")
+    embeddings, image_grid_thw = worker.generate(data)
+    print(embeddings.shape, image_grid_thw.shape)
+    # breakpoint()
+    multi_modal_data = {
+        "image": {
+            "image_embeds": embeddings.cpu(),
+            "image_grid_thw": image_grid_thw.cpu(),
+        }
+    }
+    print(embeddings.shape, image_grid_thw.shape)
+
     questions = mm_input["questions"]
 
     req_data = model_example_map[model](questions, modality)
+    print(questions)
+    # breakpoint()
 
     # Disable other modalities to save memory
     default_limits = {"image": 0, "video": 0, "audio": 0}
@@ -1425,7 +1480,7 @@ def main(args):
         "seed": args.seed,
         "disable_mm_preprocessor_cache": args.disable_mm_preprocessor_cache,
     }
-    llm = LLM(**engine_args)
+
 
     # Don't want to check the flag multiple times, so just hijack `prompts`.
     prompts = (
@@ -1445,7 +1500,7 @@ def main(args):
         # Single inference
         inputs = {
             "prompt": prompts[0],
-            "multi_modal_data": {modality: data},
+            "multi_modal_data": multi_modal_data,
         }
     else:
         # Batch inference
@@ -1459,11 +1514,12 @@ def main(args):
             inputs = [
                 {
                     "prompt": prompts[i % len(prompts)],
-                    "multi_modal_data": {modality: data},
+                    "multi_modal_data": multi_modal_data, # {modality: data},
                 }
                 for i in range(args.num_prompts)
             ]
-
+    breakpoint()
+    llm = LLM(**engine_args)
     # Add LoRA request if applicable
     lora_request = (
         req_data.lora_requests * args.num_prompts if req_data.lora_requests else None

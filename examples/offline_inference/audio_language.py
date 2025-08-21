@@ -342,6 +342,66 @@ def parse_args():
 
     return parser.parse_args()
 
+from transformers import AutoProcessor, Qwen2_5OmniThinkerForConditionalGeneration, Qwen2AudioForConditionalGeneration
+import torch
+
+class VllmEncodeWorker:
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+        self.audio_processor = AutoProcessor.from_pretrained(
+            self.model, trust_remote_code=True
+        )
+        # self.audio_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+        #     self.model, device_map="auto", torch_dtype=torch.float16
+        # ).eval()
+        self.audio_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            self.model, device_map="auto", torch_dtype=torch.float16
+        ).eval()
+
+
+    def generate(self, audio):
+        audios = []
+        for item in audio:
+            audios.append(item[0])
+            assert item[1] == 16000
+        print(audios)
+        inputs = self.audio_processor(text="test<|AUDIO|>", audio=audios, return_tensors="pt", padding=False)
+        input_features, feature_attention_mask = inputs.input_features, inputs.feature_attention_mask
+        with torch.no_grad():
+            audio_feat_lengths, audio_output_lengths = self.audio_model.audio_tower._get_feat_extract_output_lengths(
+                feature_attention_mask.sum(-1)
+            )
+            batch_size, _, max_mel_seq_len = input_features.shape
+            max_seq_len = (max_mel_seq_len - 2) // 2 + 1
+            # Create a sequence tensor of shape (batch_size, max_seq_len)
+            seq_range = (
+                torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
+                .unsqueeze(0)
+                .expand(batch_size, max_seq_len)
+            )
+            lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
+            # Create mask
+            padding_mask = seq_range >= lengths_expand
+
+            audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
+                batch_size, 1, max_seq_len, max_seq_len
+            )
+            audio_attention_mask = audio_attention_mask_.to(
+                dtype=self.audio_model.audio_tower.conv1.weight.dtype, device=self.audio_model.audio_tower.conv1.weight.device
+            )
+            audio_attention_mask[audio_attention_mask_] = float("-inf")
+
+            audio_outputs = self.audio_model.audio_tower(input_features, attention_mask=audio_attention_mask)
+            selected_audio_feature = audio_outputs.last_hidden_state
+            audio_features = self.audio_model.multi_modal_projector(selected_audio_feature)
+
+            num_audios, max_audio_tokens, embed_dim = audio_features.shape
+            audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None, :]
+            audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
+            audio_features = audio_features[audio_features_mask]
+
+            return audio_features
 
 def main(args):
     model = args.model_type
@@ -359,8 +419,10 @@ def main(args):
         req_data.engine_args.limit_mm_per_prompt or {}
     )
 
-    engine_args = asdict(req_data.engine_args) | {"seed": args.seed}
-    llm = LLM(**engine_args)
+    engine_args = asdict(req_data.engine_args) | {"seed": args.seed,  "disable_mm_preprocessor_cache": True, 'enable_prefix_caching': False}
+    print(engine_args)
+    # breakpoint()
+
 
     # We set temperature to 0.2 so that outputs can be different
     # even when all prompts are identical when running batch inference.
@@ -379,8 +441,22 @@ def main(args):
             }
 
     assert args.num_prompts > 0
-    inputs = {"multi_modal_data": mm_data}
 
+
+
+
+    worker = VllmEncodeWorker("Qwen/Qwen2-Audio-7B-Instruct")
+    embeddings = worker.generate(mm_data["audio"])
+    mm_data = {
+        "audio": {
+            "audio_embeds": embeddings.cpu().to(torch.bfloat16),
+        }
+    }
+    inputs = {"multi_modal_data": mm_data}
+    print(embeddings.shape, embeddings)
+    # breakpoint()
+
+    llm = LLM(**engine_args)
     if req_data.prompt:
         inputs["prompt"] = req_data.prompt
     else:
