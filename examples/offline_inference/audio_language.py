@@ -324,7 +324,7 @@ def parse_args():
         help='Huggingface "model_type".',
     )
     parser.add_argument(
-        "--num-prompts", type=int, default=1, help="Number of prompts to run."
+        "--num-prompts", type=int, default=4, help="Number of prompts to run."
     )
     parser.add_argument(
         "--num-audios",
@@ -418,8 +418,8 @@ def main(args):
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}
     )
-
-    engine_args = asdict(req_data.engine_args) | {"seed": args.seed,  "disable_mm_preprocessor_cache": True, 'enable_prefix_caching': False}
+    engine_args = asdict(req_data.engine_args) | {"seed": args.seed}
+    # engine_args = asdict(req_data.engine_args) | {"seed": args.seed,  "disable_mm_preprocessor_cache": False, 'enable_prefix_caching': False}
     print(engine_args)
     # breakpoint()
 
@@ -443,18 +443,20 @@ def main(args):
     assert args.num_prompts > 0
 
 
-
-
+    # breakpoint()
+    
     worker = VllmEncodeWorker("Qwen/Qwen2-Audio-7B-Instruct")
     embeddings = worker.generate(mm_data["audio"])
+    # For multiple audio cases, we need to pass a list of embeddings rather than a B,T.D or a T_concat,D Tensor.
     mm_data = {
         "audio": {
-            "audio_embeds": embeddings.cpu().to(torch.bfloat16),
+            "audio_embeds": [embeddings.cpu().to(torch.bfloat16)],
         }
     }
     inputs = {"multi_modal_data": mm_data}
     print(embeddings.shape, embeddings)
     # breakpoint()
+
 
     llm = LLM(**engine_args)
     if req_data.prompt:

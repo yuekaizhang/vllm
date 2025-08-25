@@ -52,7 +52,7 @@ from vllm.model_executor.models.qwen2_audio import (
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (ImageItem, ModalityData,
+from vllm.multimodal.inputs import (ImageItem, ModalityData, VideoItem,
                                     MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargs, NestedTensors)
 from vllm.multimodal.parse import (AudioProcessorItems, DictEmbeddingItems,
@@ -125,6 +125,33 @@ class Qwen2_5OmniThinkerMultiModalDataParser(Qwen2VLMultiModalDataParser):
 
         return super()._parse_audio_data(data)
 
+    def _parse_image_data(
+        self,
+        data: Union[dict[str, torch.Tensor], ModalityData[ImageItem]],
+    ) -> Optional[ModalityDataItems[Any, Any]]:
+        if isinstance(data, dict):
+            return DictEmbeddingItems(
+                data,
+                modality="image",
+                required_fields={"image_embeds", "image_grid_thw"},
+                fields_factory=_qwen2_5_omni_thinker_field_config,
+            )
+
+        return super()._parse_image_data(data)
+
+    def _parse_video_data(
+        self,
+        data: Union[dict[str, torch.Tensor], ModalityData[VideoItem]],
+    ) -> Optional[ModalityDataItems[Any, Any]]:
+        if isinstance(data, dict):
+            return DictEmbeddingItems(
+                data,
+                modality="video",
+                required_fields={"video_embeds", "video_grid_thw"},
+                fields_factory=_qwen2_5_omni_thinker_field_config,
+            )
+
+        return super()._parse_video_data(data)
 
 class Qwen2_5OmniThinkerProcessingInfo(Qwen2AudioProcessingInfo,
                                        Qwen2_5_VLProcessingInfo):
@@ -675,14 +702,15 @@ class Qwen2_5OmniConditionalGenerationMixin:
     def _process_image_input(
             self,
             image_input: Qwen2_5_VLImageInputs) -> tuple[torch.Tensor, ...]:
-        if image_input["type"] == "image_embeds":
-            return image_input["image_embeds"].type(self.visual.dtype)
+
 
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
-
-        pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+        if image_input["type"] == "image_embeds":
+            image_embeds = image_input["image_embeds"].type(self.visual.dtype)
+        else:
+            pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
